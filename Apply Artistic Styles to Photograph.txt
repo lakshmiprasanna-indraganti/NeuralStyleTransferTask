@@ -1,0 +1,385 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torchvision.models as models
+import numpy as np
+from PIL import Image
+import io
+import warnings
+
+warnings.filterwarnings('ignore')
+
+st.set_page_config(
+    page_title="Neural Style Transfer",
+    page_icon="🎨",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class NeuralStyleTransfer:
+    """Main class for neural style transfer operations"""
+    
+    def __init__(self):
+        self.device = device
+        self.model = None
+        
+    def get_transforms(self, img_size=512):
+        """Create image transformation pipeline"""
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+        ])
+    
+    def gram_matrix(self, input_tensor):
+        """Calculate Gram matrix for style representation"""
+        batch_size, channels, height, width = input_tensor.size()
+        features = input_tensor.view(batch_size * channels, height * width)
+        gram = torch.mm(features, features.t())
+        return gram.div(batch_size * channels * height * width)
+    
+    def load_vgg19_model(self):
+        """Load and configure VGG19 model for feature extraction"""
+        class VGGFeatureExtractor(nn.Module):
+            def __init__(self):
+                super(VGGFeatureExtractor, self).__init__()
+                # Use specific layers for content and style extraction
+                self.chosen_features = ['0', '5', '10', '19', '28']
+                self.model = models.vgg19(pretrained=True).features[:29]
+                
+                # Freeze model parameters
+                for param in self.model.parameters():
+                    param.requires_grad_(False)
+                    
+            def forward(self, x):
+                features = []
+                for layer_num, layer in enumerate(self.model):
+                    x = layer(x)
+                    if str(layer_num) in self.chosen_features:
+                        features.append(x)
+                return features
+        
+        return VGGFeatureExtractor().to(self.device).eval()
+    
+    def load_and_process_image(self, image_file, img_size):
+        """Load and preprocess image for neural network"""
+        try:
+            # Open and convert image
+            image = Image.open(image_file)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Apply transformations
+            transform = self.get_transforms(img_size)
+            image_tensor = transform(image).unsqueeze(0)
+            
+            return image_tensor.to(self.device)
+        except Exception as e:
+            st.error(f"Error processing image: {str(e)}")
+            return None
+    
+    def tensor_to_image(self, tensor):
+        """Convert tensor back to PIL Image"""
+        tensor = tensor.cpu().clone().detach().squeeze(0)
+        tensor = torch.clamp(tensor, 0, 1)
+        return transforms.ToPILImage()(tensor)
+    
+    def style_transfer(self, content_image, style_image, 
+                      style_weight=1.0, content_weight=1.0, 
+                      iterations=100, progress_callback=None):
+        """Main style transfer function"""
+        
+        # Load model
+        if self.model is None:
+            self.model = self.load_vgg19_model()
+        
+        # Initialize generated image with content image
+        generated_image = content_image.clone().requires_grad_(True)
+        
+        # Optimizer
+        optimizer = optim.Adam([generated_image], lr=0.01)
+        
+        # Extract target features
+        content_features = self.model(content_image)
+        style_features = self.model(style_image)
+        
+        # Training loop
+        for step in range(iterations):
+            optimizer.zero_grad()
+            
+            # Get features from generated image
+            generated_features = self.model(generated_image)
+            
+            # Calculate content loss (preserve content structure)
+            content_loss = torch.mean((generated_features[-2] - content_features[-2]) ** 2)
+            
+            # Calculate style loss (match style patterns)
+            style_loss = 0
+            for gen_feat, style_feat in zip(generated_features, style_features):
+                gen_gram = self.gram_matrix(gen_feat)
+                style_gram = self.gram_matrix(style_feat)
+                style_loss += torch.mean((gen_gram - style_gram) ** 2)
+            
+            # Combine losses
+            total_loss = content_weight * content_loss + style_weight * style_loss
+            
+            # Backpropagation
+            total_loss.backward()
+            optimizer.step()
+            
+            # Clamp values to valid range
+            with torch.no_grad():
+                generated_image.clamp_(0, 1)
+            
+            # Progress callback
+            if progress_callback and (step % 10 == 0 or step == iterations - 1):
+                progress_callback(step + 1, iterations, total_loss.item())
+        
+        return generated_image
+
+def main():
+    """Main Streamlit application"""
+    
+    # Title and description
+    st.title("🎨 Neural Style Transfer")
+    st.markdown("Transform your photos with artistic styles using deep learning and VGG19 neural network")
+    
+    # Initialize neural style transfer
+    if 'nst' not in st.session_state:
+        st.session_state.nst = NeuralStyleTransfer()
+    
+    if 'generated_image' not in st.session_state:
+        st.session_state.generated_image = None
+    
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Style Transfer Settings")
+        
+        # Style weight slider
+        style_weight = st.slider(
+            "Style Weight",
+            min_value=0.1,
+            max_value=10.0,
+            value=1.0,
+            step=0.1,
+            help="Controls how much style to apply. Higher = more artistic style"
+        )
+        
+        # Content weight slider
+        content_weight = st.slider(
+            "Content Weight", 
+            min_value=0.1,
+            max_value=10.0,
+            value=1.0,
+            step=0.1,
+            help="Controls content preservation. Higher = more original content"
+        )
+        
+        # Iterations slider
+        iterations = st.slider(
+            "Optimization Iterations",
+            min_value=50,
+            max_value=500,
+            value=200,
+            step=50,
+            help="More iterations = better quality but slower processing"
+        )
+        
+        # Image size selection
+        img_size = st.selectbox(
+            "Processing Size",
+            [256, 384, 512, 768],
+            index=2,
+            help="Larger sizes produce better quality but take longer"
+        )
+        
+        # Device info
+        st.info(f"Processing on: {device.type.upper()}")
+    
+    # Main content area - image uploads
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📷 Content Image")
+        st.markdown("Upload the photo you want to stylize")
+        
+        content_file = st.file_uploader(
+            "Choose content image",
+            type=['png', 'jpg', 'jpeg'],
+            key="content_upload",
+            help="Supported formats: PNG, JPG, JPEG"
+        )
+        
+        if content_file is not None:
+            content_img = Image.open(content_file)
+            st.image(content_img, caption="Your photo", use_container_width=True)
+    
+    with col2:
+        st.subheader("🎨 Style Reference")
+        st.markdown("Upload artwork or painting for style")
+        
+        style_file = st.file_uploader(
+            "Choose style image",
+            type=['png', 'jpg', 'jpeg'], 
+            key="style_upload",
+            help="Use paintings, artwork, or any image with distinctive style"
+        )
+        
+        if style_file is not None:
+            style_img = Image.open(style_file)
+            st.image(style_img, caption="Style reference", use_container_width=True)
+    
+    # Process button
+    if content_file is not None and style_file is not None:
+        st.markdown("---")
+        
+        col_process = st.columns([1, 2, 1])
+        with col_process[1]:
+            if st.button("🚀 Generate Style Transfer", type="primary", use_container_width=True):
+                
+                # Processing workflow
+                try:
+                    with st.spinner("Loading neural network model..."):
+                        nst = st.session_state.nst
+                    
+                    with st.spinner("Processing images..."):
+                        # Load and process images
+                        content_tensor = nst.load_and_process_image(content_file, img_size)
+                        style_tensor = nst.load_and_process_image(style_file, img_size)
+                        
+                        if content_tensor is None or style_tensor is None:
+                            st.error("Failed to process images. Please try different images.")
+                            st.stop()
+                    
+                    # Progress tracking
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    loss_text = st.empty()
+                    
+                    def update_progress(step, total_steps, loss_value):
+                        progress = step / total_steps
+                        progress_bar.progress(progress)
+                        status_text.text(f"Processing: {step}/{total_steps} iterations ({progress:.1%})")
+                        loss_text.text(f"Current loss: {loss_value:.4f}")
+                    
+                    # Run style transfer
+                    with st.spinner("Applying neural style transfer..."):
+                        result_tensor = nst.style_transfer(
+                            content_tensor,
+                            style_tensor,
+                            style_weight=style_weight,
+                            content_weight=content_weight,
+                            iterations=iterations,
+                            progress_callback=update_progress
+                        )
+                    
+                    # Convert result to image
+                    st.session_state.generated_image = nst.tensor_to_image(result_tensor)
+                    
+                    # Success message
+                    progress_bar.progress(1.0)
+                    status_text.text("✅ Style transfer completed successfully!")
+                    loss_text.empty()
+                    
+                    st.success("Your stylized image is ready!")
+                    
+                except Exception as e:
+                    st.error(f"Error during style transfer: {str(e)}")
+                    st.error("Please check your images and try again.")
+                    import traceback
+                    st.code(traceback.format_exc())
+    
+    # Results display
+    if st.session_state.generated_image is not None:
+        st.markdown("---")
+        st.subheader("🎯 Results")
+        
+        # Three-column comparison
+        result_cols = st.columns(3)
+        
+        with result_cols[0]:
+            if content_file is not None:
+                st.image(Image.open(content_file), caption="Original Content", use_container_width=True)
+        
+        with result_cols[1]:
+            if style_file is not None:
+                st.image(Image.open(style_file), caption="Style Reference", use_container_width=True)
+        
+        with result_cols[2]:
+            st.image(st.session_state.generated_image, caption="Generated Result", use_container_width=True)
+        
+        # Download section
+        st.markdown("---")
+        download_col = st.columns([1, 2, 1])
+        with download_col[1]:
+            # Convert image to bytes for download
+            img_buffer = io.BytesIO()
+            st.session_state.generated_image.save(img_buffer, format='PNG', quality=95)
+            img_bytes = img_buffer.getvalue()
+            
+            st.download_button(
+                label="📥 Download Stylized Image",
+                data=img_bytes,
+                file_name=f"neural_style_transfer_{style_weight}_{content_weight}.png",
+                mime="image/png",
+                type="secondary",
+                use_container_width=True
+            )
+    
+    # Information and tips
+    with st.expander("ℹ️ How Neural Style Transfer Works"):
+        st.markdown("""
+        ### The Science Behind Style Transfer
+        
+        **Neural Style Transfer** uses deep learning to combine the content of one image with the style of another:
+        
+        1. **Feature Extraction**: A pre-trained VGG19 network extracts features from both images
+        2. **Content Representation**: Deep layers capture the structure and objects in your photo
+        3. **Style Representation**: Gram matrices from multiple layers capture artistic patterns and textures
+        4. **Optimization**: An algorithm iteratively adjusts a generated image to match both content and style
+        
+        ### Tips for Best Results
+        
+        **Content Images:**
+        - Use clear, well-lit photos
+        - Simple compositions work better than cluttered scenes
+        - Higher resolution gives better detail
+        
+        **Style Images:**
+        - Paintings and artwork with distinct brushstrokes work best
+        - High contrast styles produce more dramatic effects
+        - Try famous paintings like Van Gogh, Picasso, or Monet
+        
+        **Parameter Tuning:**
+        - **Higher Style Weight**: More artistic, less recognizable
+        - **Higher Content Weight**: More realistic, preserves original structure
+        - **More Iterations**: Better quality but slower processing
+        - **Larger Size**: More detail but requires more processing time
+        
+        **Supported Formats:** PNG, JPG, JPEG
+        """)
+    
+    # Performance notes
+    with st.expander("⚡ Performance Information"):
+        st.markdown(f"""
+        **Current Configuration:**
+        - Processing Device: {device.type.upper()}
+        - Model: VGG19 (Pre-trained on ImageNet)
+        - Optimization: Adam optimizer with adaptive learning rate
+        
+        **Processing Times (approximate):**
+        - 256px: 1-2 minutes on CPU, 30-60 seconds on GPU
+        - 512px: 3-5 minutes on CPU, 1-2 minutes on GPU  
+        - 768px: 8-12 minutes on CPU, 3-5 minutes on GPU
+        
+        **Memory Requirements:**
+        - Minimum: 4GB RAM
+        - Recommended: 8GB+ RAM for larger images
+        - GPU: 2GB+ VRAM recommended for faster processing
+        """)
+
+if __name__ == "__main__":
+    main()
